@@ -1,0 +1,260 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Simple 1:1 Low-Band WebRTC</title>
+<style>
+  body{font-family:Arial;margin:12px}
+  video{width:320px;height:240px;background:#000;margin:6px}
+  #controls{margin-top:10px}
+  input, button {padding:8px;margin:4px}
+  #log{white-space:pre-wrap;font-family:monospace;background:#f3f3f3;padding:8px;height:120px;overflow:auto}
+</style>
+</head>
+<body>
+<h3>เว็บโทร 1:1 (optimized 256kbps)</h3>
+<div>
+  <label>Server WS URL: <input id="wsUrl" value="ws://localhost:3000" style="width:260px"></label>
+</div>
+<div id="controls">
+  <button id="createBtn">สร้างห้อง</button>
+  <input id="roomId" placeholder="หรือใส่ room id เพื่อเข้าร่วม" />
+  <button id="joinBtn">เข้าร่วมห้อง</button>
+  <button id="startLocal" disabled>เปิดกล้อง/ไมค์</button>
+  <button id="hangup" disabled>วางสาย</button>
+</div>
+
+<div>
+  <video id="localVideo" autoplay muted playsinline></video>
+  <video id="remoteVideo" autoplay playsinline></video>
+</div>
+
+<div id="log"></div>
+
+<script>
+(async () => {
+  const logEl = document.getElementById('log');
+  const log = (...args) => { console.log(...args); logEl.textContent += args.join(' ') + '\\n'; logEl.scrollTop = logEl.scrollHeight; };
+
+  const wsUrlInput = document.getElementById('wsUrl');
+  const createBtn = document.getElementById('createBtn');
+  const joinBtn = document.getElementById('joinBtn');
+  const roomIdInput = document.getElementById('roomId');
+  const startLocalBtn = document.getElementById('startLocal');
+  const hangupBtn = document.getElementById('hangup');
+  const localVideo = document.getElementById('localVideo');
+  const remoteVideo = document.getElementById('remoteVideo');
+
+  let ws, pc, localStream;
+  let isCaller = false;
+
+  function connectWS() {
+    if (ws && ws.readyState === WebSocket.OPEN) return ws;
+    ws = new WebSocket(wsUrlInput.value);
+    ws.addEventListener('open', () => log('WS connected'));
+    ws.addEventListener('message', ev => onWs(JSON.parse(ev.data)));
+    ws.addEventListener('close', () => log('WS closed'));
+    ws.addEventListener('error', e => log('WS err', e));
+    return ws;
+  }
+
+  function sendWS(obj) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) connectWS();
+    ws.addEventListener('open', () => ws.send(JSON.stringify(obj)), { once: true });
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  }
+
+  createBtn.onclick = () => {
+    connectWS();
+    sendWS({ action:'create' });
+    isCaller = true;
+    startLocalBtn.disabled = false;
+    log('สร้างห้อง กดเปิดกล้องเพื่อเริ่ม');
+    // server will reply created with roomId
+    ws.addEventListener('message', function once(ev){
+      try{
+        const m = JSON.parse(ev.data);
+        if(m.action==='created') {
+          roomIdInput.value = m.roomId;
+          log('ห้องสร้างแล้ว id:', m.roomId);
+          ws.removeEventListener('message', once);
+        }
+      }catch(e){}
+    });
+  };
+
+  joinBtn.onclick = () => {
+    connectWS();
+    const id = roomIdInput.value.trim();
+    if(!id){ alert('ใส่ room id ก่อน'); return; }
+    sendWS({ action:'join', roomId: id });
+    startLocalBtn.disabled = false;
+    log('พยายามเข้าร่วมห้อง', id);
+  };
+
+  startLocalBtn.onclick = async () => {
+    startLocalBtn.disabled = true;
+    try {
+      // very low-res constraints to save bandwidth
+      const constraints = {
+        audio: { sampleRate: 16000, channelCount: 1 },
+        video: {
+          width: { ideal: 320 },
+          height: { ideal: 240 },
+          frameRate: { ideal: 12, max: 15 }
+        }
+      };
+      localStream = await navigator.mediaDevices.getUserMedia(constraints);
+      localVideo.srcObject = localStream;
+      log('Local stream ready');
+
+      // create peer connection
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+
+      // prefer codecs: Opus, VP8
+      function preferCodecs(sdp) {
+        // naive SDP munging - prefer opus and vp8
+        sdp = sdp.replace(/m=audio (\\d+) RTP\\/SAVPF (.+)\\r\\n/, (m, a, b) => {
+          if(b.includes('111')) return m; // opus often 111
+          return m;
+        });
+        // NOTE: browser usually picks good codec; extra complex munging omitted for brevity
+        return sdp;
+      }
+
+      // add tracks
+      for (const track of localStream.getTracks()){
+        pc.addTrack(track, localStream);
+      }
+
+      pc.ontrack = (ev) => {
+        remoteVideo.srcObject = ev.streams[0];
+        log('Remote track received');
+      };
+
+      pc.onicecandidate = (ev) => {
+        if(ev.candidate) sendWS({ action:'candidate', data: ev.candidate });
+      };
+
+      pc.onconnectionstatechange = () => {
+        log('PC state', pc.connectionState);
+      };
+
+      // set encoding constraints once sender available
+      function applySenderParams() {
+        // audio bitrate
+        const audioSender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+        if (audioSender) {
+          try {
+            const params = audioSender.getParameters();
+            params.encodings = params.encodings && params.encodings.length ? params.encodings : [{}];
+            params.encodings[0].maxBitrate = 64000; // 64kbps
+            audioSender.setParameters(params);
+            log('audio sender params set');
+          } catch (e) { log('audio setParams err', e); }
+        }
+        // video bitrate
+        const videoSender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+        if (videoSender) {
+          try {
+            const params = videoSender.getParameters();
+            params.encodings = params.encodings && params.encodings.length ? params.encodings : [{}];
+            params.encodings[0].maxBitrate = 160000; // 160kbps
+            // scale down to reduce bandwidth on poor networks
+            params.encodings[0].scaleResolutionDownBy = 2;
+            videoSender.setParameters(params);
+            log('video sender params set');
+          } catch (e) { log('video setParams err', e); }
+        }
+      }
+
+      // small helper to create offer/answer
+      if (isCaller) {
+        const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+        offer.sdp = preferCodecs(offer.sdp);
+        await pc.setLocalDescription(offer);
+        sendWS({ action:'offer', data: offer });
+        log('offer sent');
+      }
+
+      // once senders exist, tweak params
+      setTimeout(applySenderParams, 500);
+
+      hangupBtn.disabled = false;
+    } catch (e) {
+      log('getUserMedia err', e);
+      startLocalBtn.disabled = false;
+    }
+  };
+
+  hangupBtn.onclick = () => {
+    if (pc) {
+      pc.close();
+      pc = null;
+    }
+    if (localStream) {
+      localStream.getTracks().forEach(t => t.stop());
+      localStream = null;
+    }
+    sendWS({ action:'leave' });
+    startLocalBtn.disabled = false;
+    hangupBtn.disabled = true;
+    log('hung up');
+  };
+
+  // incoming WS messages
+  async function onWs(msg) {
+    const { action, data, roomId } = msg;
+    log('WS <-', action);
+    if (action === 'peer-joined') {
+      log('เพื่อนเข้าห้อง กูจะสร้าง offer ให้ (ถ้ามึงเป็น caller)');
+      // if not caller, wait for offer
+      if (isCaller && pc && pc.signalingState === 'stable') {
+        // already created offer in startLocal flow
+      }
+    } else if (action === 'offer') {
+      // remote offer received -> create answer
+      if (!pc) {
+        // ensure local stream exists and pc created
+        log('รับ offer แต่ยังไม่มี pc/stream -> สร้าง local stream');
+        await startLocalBtn.click();
+      }
+      await pc.setRemoteDescription(new RTCSessionDescription(data));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      sendWS({ action:'answer', data: answer });
+      log('answer sent');
+      // tweak senders
+      setTimeout(() => {
+        try { pc.getSenders().forEach(s => s.setParameters && s.setParameters(s.getParameters())); } catch(e){}
+      }, 500);
+    } else if (action === 'answer') {
+      await pc.setRemoteDescription(new RTCSessionDescription(data));
+      log('remote answer set');
+    } else if (action === 'candidate') {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(data));
+      } catch (e) { console.warn('addIceCandidate err', e); }
+    } else if (action === 'created') {
+      roomIdInput.value = roomId || roomIdInput.value;
+      log('ห้องได้ id', roomIdInput.value);
+    } else if (action === 'joined') {
+      log('joined room', roomId);
+      // if creator already startLocal and isCaller true, create offer; handled earlier
+    } else if (action === 'peer-left') {
+      log('เพื่อนออกจากห้อง');
+      if (remoteVideo.srcObject) remoteVideo.srcObject.getTracks().forEach(t => t.stop());
+      remoteVideo.srcObject = null;
+    } else if (action === 'error') {
+      log('server error', msg.reason);
+    }
+  }
+
+  // reconnect ws on page load
+  connectWS();
+})();
+</script>
+</body>
+</html>
