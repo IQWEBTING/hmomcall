@@ -1,13 +1,20 @@
-// server.js
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
+const http = require('http');
 
 const port = process.env.PORT || 3000;
-const wss = new WebSocket.Server({ port });
 
-console.log('Signaling server listening on port', port);
+// สร้าง HTTP server (Render ต้องการ)
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('WebRTC signaling server is running');
+});
 
-// roomId -> [ws, ws]
+// attach websocket เข้ากับ http server
+const wss = new WebSocket.Server({ server });
+
+console.log('Signaling server starting...');
+
 const rooms = new Map();
 
 wss.on('connection', (ws) => {
@@ -31,10 +38,50 @@ wss.on('connection', (ws) => {
     }
 
     if (action === 'join') {
-      const id = roomId;
-      if (!id || !rooms.has(id)) {
+      if (!roomId || !rooms.has(roomId)) {
         ws.send(JSON.stringify({ action: 'error', reason: 'room-not-found' }));
         return;
+      }
+      ws.roomId = roomId;
+      rooms.get(roomId).push(ws);
+      rooms.get(roomId).forEach(peer => {
+        if (peer !== ws) peer.send(JSON.stringify({ action: 'peer-joined' }));
+      });
+      ws.send(JSON.stringify({ action: 'joined', roomId }));
+      console.log('joined room', roomId);
+      return;
+    }
+
+    if (['offer', 'answer', 'candidate', 'leave'].includes(action)) {
+      const peers = rooms.get(ws.roomId) || [];
+      peers.forEach(peer => {
+        if (peer !== ws && peer.readyState === WebSocket.OPEN) {
+          peer.send(JSON.stringify({ action, data }));
+        }
+      });
+      if (action === 'leave') {
+        rooms.set(ws.roomId, peers.filter(p => p !== ws));
+      }
+    }
+  });
+
+  ws.on('close', () => {
+    if (ws.roomId) {
+      const arr = rooms.get(ws.roomId) || [];
+      const newArr = arr.filter(p => p !== ws);
+      if (newArr.length === 0) rooms.delete(ws.roomId);
+      else rooms.set(ws.roomId, newArr);
+      newArr.forEach(peer => {
+        if (peer.readyState === WebSocket.OPEN)
+          peer.send(JSON.stringify({ action: 'peer-left' }));
+      });
+    }
+  });
+});
+
+server.listen(port, () => {
+  console.log('HTTP+WS server listening on', port);
+});        return;
       }
       ws.roomId = id;
       rooms.get(id).push(ws);
